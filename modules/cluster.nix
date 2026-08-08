@@ -205,8 +205,9 @@ let
   ## ---------------------------------------------------------------------
 
   # Kept TOTAL rather than assuming the named forge is declared. An assertion below refuses that
-  # case, and an assertion's message is forced whether or not it holds -- so a helper that threw on
-  # the broken input would take the evaluation down instead of reporting it.
+  # case, and the messages that ever get formatted are exactly the FAILING ones -- so a helper that
+  # threw on the broken input would throw precisely when the refusal is trying to report it, taking
+  # the evaluation down instead of naming the undeclared forge.
   forgeKeyOf = w:
     if (w ? forge) && w.forge != null && (cfg.forges ? ${w.forge})
     then catalogue.forges.${cfg.forges.${w.forge}.forge}.key
@@ -353,9 +354,16 @@ let
   ## ---------------------------------------------------------------------
   ## Assertions
   ##
-  ## Every message is a TOTAL function of the declaration: an assertion's message is forced whether
-  ## or not the assertion holds, so a message that only works in the failing case takes the whole
-  ## evaluation down instead of reporting anything.
+  ## The module system filters the assertions down to the FAILING ones and only then formats their
+  ## messages. A passing assertion's message is never evaluated at all, and two things follow.
+  ##
+  ## Every message here is a TOTAL function of the declaration, because a message that throws on a
+  ## partial declaration throws at exactly the moment its own assertion has failed -- the one moment
+  ## it was written for -- and takes the evaluation down instead of reporting anything.
+  ##
+  ## And a value mentioned ONLY in a message is never forced, so its type is never checked either.
+  ## Whatever an assertion wants checked has to be in its `assertion` expression. See nixwatch's
+  ## study `an-option-nothing-renders-is-never-checked`.
   ## ---------------------------------------------------------------------
 
   listNames = names: lib.concatMapStringsSep ", " (n: "`${n}`") names;

@@ -19,6 +19,12 @@ file below.
   second half is the more useful one: a consumer who assumed a semantic version there would have got
   a pull error at the far end of a sync.
 
+  **It has also been wrong once, and the way it was wrong is worth knowing before writing anything
+  else here.** Under `set -o pipefail` it fed a chart index into `grep -q` through a pipe, and
+  `grep -q` exits on its first match — so the writer died of SIGPIPE and the pipeline reported a
+  successful match as a failure, but only once the index outgrew a pipe buffer. Written up in
+  [`../studies/a-successful-match-reported-as-a-failure.md`](../studies/a-successful-match-reported-as-a-failure.md).
+
 ## Why this lives here and not in `checks/`
 
 `checks/` is `nix flake check`-wired and evaluates offline. It can prove how a declaration

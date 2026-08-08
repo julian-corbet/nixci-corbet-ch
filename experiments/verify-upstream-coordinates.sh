@@ -99,8 +99,16 @@ check_oci() {
   fi
 }
 
+# NOTHING THAT EXITS EARLY MAY SIT ON THE RIGHT-HAND SIDE OF A PIPE IN HERE, and that is a
+# correctness rule rather than a style preference. `grep -q` stops the instant it matches and `head`
+# the instant it has its lines; the process still writing into that pipe then dies of SIGPIPE with
+# status 141; and `set -o pipefail` makes 141 the PIPELINE's status. So a SUCCESSFUL match on a
+# large input reads as a failure here, while a small input passes because the writer finishes before
+# the reader can exit -- a chart index of a few kilobytes is fine and one of a few megabytes reports
+# that its own charts are missing. Feeding grep from a here-string, and giving head an already
+# complete string, keeps the match's status the whole status.
 check_chart_http() {
-  local repo="$1" name="$2" index
+  local repo="$1" name="$2" index versions
   if ! have curl; then
     report UNCHECKED "chart -> $repo :: $name (no curl)"; unchecked=$((unchecked + 1)); return
   fi
@@ -108,11 +116,11 @@ check_chart_http() {
   if [ -z "$index" ]; then
     report FAIL "chart -> $repo (no index.yaml)"; bad=$((bad + 1)); return
   fi
-  if printf '%s' "$index" | grep -q "name: *$name"; then
+  if grep -q "name: *$name" <<<"$index"; then
     report OK "chart -> $repo :: $name"; ok=$((ok + 1))
     if [ "$tags" -gt 0 ]; then
-      printf '%s' "$index" | grep -A3 "name: *$name" | grep 'version:' \
-        | head -n "$tags" | sed 's/^/            /'
+      versions="$(grep -A3 "name: *$name" <<<"$index" | grep 'version:')"
+      head -n "$tags" <<<"$versions" | sed 's/^/            /'
     fi
   else
     report FAIL "chart -> $repo :: $name is not in that repository's index"
