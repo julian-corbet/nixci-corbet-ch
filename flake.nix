@@ -32,7 +32,21 @@
   outputs = { self, nixpkgs, nixidy, nixk3s }:
     let
       lib = nixpkgs.lib;
-      forAllSystems = lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
+      # x86_64 ONLY, and the narrowing is what makes CI able to run at all.
+      #
+      # `checks` below renders the cluster module through the REAL renderer, and nixidy's
+      # `fromYAML` reads a file it first has to BUILD -- import-from-derivation. Evaluating these
+      # checks for a foreign system therefore demands a builder for that system before the check
+      # even exists as a derivation, and no runner this platform can offer has one. On the previous
+      # two-system list, `nix flake check --all-systems` fails outright with "Cannot build
+      # '...-fromYAML.drv' -- required system: aarch64-linux", and a bare `nix flake check` hides
+      # that instead of reporting it: it omits the systems it cannot evaluate, prints a warning,
+      # and exits 0.
+      #
+      # That second failure mode is precisely what this repository's checks/ exists to refuse -- a
+      # verifier laundering a wrong answer as a checked one. Declaring only what can genuinely be
+      # evaluated is what lets ci.yml pass `--all-systems` and mean it.
+      forAllSystems = lib.genAttrs [ "x86_64-linux" ];
       pkgsFor = system: nixpkgs.legacyPackages.${system};
     in
     {
