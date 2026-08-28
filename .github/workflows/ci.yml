@@ -25,8 +25,9 @@ permissions:
   contents: read
 
 # The native checks, the all-system evaluation and the inventory are independent verdicts. The
-# matrix builds every check on hardware of its declared architecture; the no-build pass proves no
-# declared system is hidden; the inventory proves a check did not disappear while both stayed green.
+# matrix builds every check on hardware of its declared architecture; the lazy cross-system pass
+# proves no declared system is hidden; the inventory proves a check did not disappear while both
+# stayed green.
 jobs:
   check:
     name: nix flake check (${{ matrix.system }})
@@ -57,7 +58,7 @@ jobs:
           nix flake check --keep-going --print-build-logs
 
   eval-all-systems:
-    name: every declared system evaluates
+    name: every declared system and check is covered
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -66,8 +67,32 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - name: nix flake check --all-systems --no-build
-        run: nix flake check --all-systems --no-build --keep-going --print-build-logs
+      # nixidy parses rendered YAML through an intentional import-from-derivation. A cross-system
+      # `nix flake check --all-systems --no-build` therefore cannot evaluate these checks: no-build
+      # forbids the fromYAML derivation evaluation needs, while building the ARM derivation on this
+      # x86 runner would be equally false coverage. The two native matrix jobs above perform the
+      # complete evaluation and build. This independent lazy pass proves that their matrix still
+      # names every system and every check the flake declares.
+      - name: assert every system and check is covered
+        run: |
+          set -euo pipefail
+
+          expected_systems='["aarch64-linux","x86_64-linux"]'
+          actual_systems=$(nix eval --json .#checks --apply builtins.attrNames)
+          if [ "$actual_systems" != "$expected_systems" ]; then
+            echo "::error::declared systems changed: expected $expected_systems, got $actual_systems"
+            exit 1
+          fi
+
+          expected_checks='["clients-eval","cluster-eval","cluster-render"]'
+          for system in aarch64-linux x86_64-linux; do
+            actual_checks=$(nix eval --json ".#checks.$system" --apply builtins.attrNames)
+            if [ "$actual_checks" != "$expected_checks" ]; then
+              echo "::error::$system checks changed: expected $expected_checks, got $actual_checks"
+              exit 1
+            fi
+            echo "$system: $actual_checks"
+          done
 
   checks-present:
     name: the declared checks are still declared
