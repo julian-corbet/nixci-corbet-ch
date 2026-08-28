@@ -27,7 +27,6 @@ let
     nixci.platform = {
       controlNamespace = "example-ci";
       executionNamespace = "example-ci-runners";
-      project = "example-ci";
     };
   };
 
@@ -57,6 +56,8 @@ let
   ## ---------------------------------------------------------------------
 
   good = {
+    nixci.platform.project = "example-ci";
+
     nixci.forges = {
       forge = {
         forge = "forgejo";
