@@ -32,29 +32,19 @@
   outputs = { self, nixpkgs, nixidy, nixk3s }:
     let
       lib = nixpkgs.lib;
-      # x86_64 ONLY, and the narrowing is what makes CI able to run at all.
-      #
-      # `checks` below renders the cluster module through the REAL renderer, and nixidy's
-      # `fromYAML` reads a file it first has to BUILD -- import-from-derivation. Evaluating these
-      # checks for a foreign system therefore demands a builder for that system before the check
-      # even exists as a derivation, and no runner this platform can offer has one. On the previous
-      # two-system list, `nix flake check --all-systems` fails outright with "Cannot build
-      # '...-fromYAML.drv' -- required system: aarch64-linux", and a bare `nix flake check` hides
-      # that instead of reporting it: it omits the systems it cannot evaluate, prints a warning,
-      # and exits 0.
-      #
-      # That second failure mode is precisely what this repository's checks/ exists to refuse -- a
-      # verifier laundering a wrong answer as a checked one. Declaring only what can genuinely be
-      # evaluated is what lets ci.yml pass `--all-systems` and mean it.
-      forAllSystems = lib.genAttrs [ "x86_64-linux" ];
+      forAllSystems = lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
       pkgsFor = system: nixpkgs.legacyPackages.${system};
+      clusterModule = import ./modules/cluster.nix {
+        catalogue = self.lib.systems;
+        inherit (nixk3s.lib) mkConsumerModule;
+      };
     in
     {
       # The cluster plane, both halves of it. Composed into a nixidy environment ALONGSIDE the app
       # grammar, which declares the options this module defines into -- see modules/cluster.nix's
       # own header.
-      nixidyModules.nixci = ./modules/cluster.nix;
-      nixidyModules.default = ./modules/cluster.nix;
+      nixidyModules.nixci = clusterModule;
+      nixidyModules.default = clusterModule;
 
       # The host plane, for the commands a person drives this platform with. Here the system is nix,
       # so the backend installs; on Arch there is nothing to install FROM, so the policy module IS
@@ -68,7 +58,7 @@
       # Policy alone, for a consumer that wants the computed lists and will wire them itself, plus
       # the raw catalogues for inspection without re-reading the files.
       lib.clientsPolicy = ./modules/clients.nix;
-      lib.cluster = ./modules/cluster.nix;
+      lib.cluster = clusterModule;
       lib.systems = import ./lib/systems.nix { };
       lib.clients = import ./lib/clients.nix { };
 

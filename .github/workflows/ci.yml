@@ -24,22 +24,41 @@ concurrency:
 permissions:
   contents: read
 
-# TWO INDEPENDENT JOBS, AND DELIBERATELY NO `needs:` BETWEEN THEM. `check` proves the checks pass;
-# `checks-present` proves the checks that passed are the ones this repository claims to have. The
-# second question is not downstream of the first -- a check silently disappearing is exactly the
-# case where the first job goes green with less coverage than yesterday, so making the inventory
-# wait on the run it is meant to police would defeat it. Both run on every push and each reports its
-# own verdict.
+# The native checks, the all-system evaluation and the inventory are independent verdicts. The
+# matrix builds every check on hardware of its declared architecture; the no-build pass proves no
+# declared system is hidden; the inventory proves a check did not disappear while both stayed green.
 jobs:
   check:
-    name: nix flake check (every declared system)
+    name: nix flake check (${{ matrix.system }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: nix flake check (${{ matrix.system }})
+        run: |
+          set -euo pipefail
+          actual=$(nix eval --impure --raw --expr builtins.currentSystem)
+          if [ "$actual" != "${{ matrix.system }}" ]; then
+            echo "runner is '$actual', expected '${{ matrix.system }}'" >&2
+            exit 1
+          fi
+          nix flake check --keep-going --print-build-logs
+
+  eval-all-systems:
+    name: every declared system evaluates
     runs-on: ubuntu-latest
-    # No run history exists for this repository yet -- this workflow is the first. Sized from the
-    # sibling that does the same work (a nixidy render through the real app grammar) and completes
-    # in about a minute on a warm cache, with a wide margin for a cold one on first run. Revisit
-    # against real durations from `gh run list` once a handful have landed; the number exists so a
-    # HUNG job fails instead of holding a runner and the concurrency slot indefinitely, not as a
-    # performance target.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -47,32 +66,8 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-
-      # --all-systems is NOT optional here, and is the whole reason this file spells the command out
-      # rather than running a bare `nix flake check`.
-      #
-      # Without it, `nix flake check` evaluates only the checks for the RUNNER's own system and
-      # prints "omitted these incompatible systems" as a warning -- then exits 0. Every other system
-      # the flake declares goes unevaluated while CI reports green: a check that passed having
-      # tested nothing, which is the precise failure mode checks/ in this repository exists to
-      # refuse. Shipping it in this file would be self-refuting.
-      #
-      # `forAllSystems` in flake.nix is deliberately narrow so this can be strict: nixidy's
-      # `fromYAML` is import-from-derivation, so evaluating these checks for a foreign system needs
-      # a builder for that system before the check even exists, and no runner has one. Only the
-      # platform that can genuinely be evaluated is declared, and it really is evaluated.
-      #
-      # --keep-going: one failing check must not abort the checks that have not run yet. The three
-      # checks here answer three different questions -- what the catalogue resolves to, what the
-      # cluster module refuses, and what the manifests actually contain -- and a reader who is shown
-      # only the first failure cannot tell whether one thing broke or all three did. Every check
-      # reports its own verdict; the run is still red if any of them failed.
-      #
-      # --print-build-logs: cluster-render's whole output IS its log -- it asserts field by field
-      # and prints an ok/FAIL line for each. Without the build log in the run output, a red mark
-      # here names a derivation and nothing else.
-      - name: nix flake check (all systems)
-        run: nix flake check --all-systems --keep-going --print-build-logs
+      - name: nix flake check --all-systems --no-build
+        run: nix flake check --all-systems --no-build --keep-going --print-build-logs
 
   checks-present:
     name: the declared checks are still declared

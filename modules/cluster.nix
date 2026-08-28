@@ -77,12 +77,11 @@
 # it deploys would not make the remote forge go away -- it would only make it invisible.
 #
 # ONE NAMESPACE. Everything declared here lives under `nixci`, like every repo in this family.
+{ catalogue, mkConsumerModule }:
 { config, lib, ... }:
 let
   cfg = config.nixci;
   platform = cfg.platform;
-
-  catalogue = import ../lib/systems.nix { };
 
   enabledOf = attrs: lib.filterAttrs (_: w: w.enable) attrs;
 
@@ -111,27 +110,34 @@ let
     credentials = { };
   };
 
-  # Every declared workload, tagged with its kind and its catalogue entry, in one list. Almost every
-  # guard here is about the platform AS A WHOLE -- a Secret named from both planes, two workloads on
-  # one slot, two workloads creating one namespace -- so they are written against this rather than
-  # against six separate tables.
-  allWorkloads =
-    lib.mapAttrsToList (name: w: { inherit name w; kind = "forge"; entry = catalogue.forges.${w.forge}; }) forges
-    ++ lib.mapAttrsToList (name: w: { inherit name w; kind = "server"; entry = catalogue.servers.${w.server}; }) servers
-    ++ lib.mapAttrsToList (name: w: { inherit name w; kind = "cache"; entry = catalogue.caches.${w.cache}; }) caches
-    ++ lib.mapAttrsToList (name: w: { inherit name w; kind = "controller"; entry = catalogue.controllers.${w.controller}; }) controllers
-    ++ lib.mapAttrsToList (name: w: { inherit name w; kind = "runner"; entry = catalogue.runners.${w.runner}; }) runners
-    ++ lib.mapAttrsToList (name: w: { inherit name w; kind = "job"; entry = jobEntry; }) jobs;
-
-  workloadsOfKind = k: lib.filter (x: x.kind == k) allWorkloads;
+  # Factory contexts arrive grouped by root. Preserve the old forge/server/cache/controller/runner/job
+  # order anywhere it was observable in a report or diagnostic, and retain the old singular kind
+  # names for CI-domain guards (the factory's own `kind` is the app/manifest/reference route).
+  rootOrder = [ "forges" "servers" "caches" "controllers" "runners" "jobs" ];
+  legacyKinds = {
+    forges = "forge";
+    servers = "server";
+    caches = "cache";
+    controllers = "controller";
+    runners = "runner";
+    jobs = "job";
+  };
+  orderedWorkloads = workloads:
+    lib.concatMap
+      (root:
+        map (x: x // { legacyKind = legacyKinds.${root}; })
+          (lib.filter (x: x.root == root) workloads))
+      rootOrder;
+  workloadsOfKind = kind: workloads:
+    lib.filter (x: x.legacyKind == kind) workloads;
 
   ## ---------------------------------------------------------------------
   ## The planes
   ## ---------------------------------------------------------------------
 
   planeOf = x: x.entry.plane;
-  onControl = lib.filter (x: planeOf x == "control") allWorkloads;
-  onExecution = lib.filter (x: planeOf x == "execution") allWorkloads;
+  onControl = workloads: lib.filter (x: planeOf x == "control") workloads;
+  onExecution = workloads: lib.filter (x: planeOf x == "execution") workloads;
 
   # THE ONE PLACE A NAMESPACE COMES FROM. There is no per-workload option, and there will not be
   # one: the plane a workload belongs to decides where it lands, and the plane is the catalogue's.
@@ -144,14 +150,15 @@ let
 
   deliveryOf = x: x.entry.delivery;
 
-  byGrammar = lib.filter (x: deliveryOf x == "image") allWorkloads;
+  byGrammar = workloads: lib.filter (x: deliveryOf x == "image") workloads;
 
   # A chart-delivered workload with nothing to deliver renders no Application at all. That is the
   # correct shape when its chart is deployed by something else in the same cluster -- the
   # declaration still buys every interlock -- and it warns, so the absence is never silent.
-  directly = lib.filter (x: deliveryOf x == "chart" && x.w.manifests != [ ]) allWorkloads;
+  directly = workloads:
+    lib.filter (x: deliveryOf x == "chart" && x.w.manifests != [ ]) workloads;
 
-  notRendered = lib.filter (x: deliveryOf x == "reference") allWorkloads;
+  notRendered = workloads: lib.filter (x: deliveryOf x == "reference") workloads;
 
   ## ---------------------------------------------------------------------
   ## Translation into the app grammar
@@ -217,7 +224,7 @@ let
     builtins.replaceStrings [ "{FORGE}" ] [ (lib.toUpper (forgeKeyOf w)) ] template;
 
   forgeEnvOf = x:
-    lib.optionalAttrs (x.kind == "server")
+    lib.optionalAttrs (x.root == "servers")
       ({ ${withForge x.w x.entry.forgeEnableEnv} = "true"; }
         // lib.optionalAttrs (x.w.forgeUrl != null) {
         ${withForge x.w x.entry.forgeUrlEnv} = x.w.forgeUrl;
@@ -238,7 +245,7 @@ let
       serverEntry = catalogue.servers.${servers.${target}.server};
     in
     lib.optionalAttrs
-      (x.kind == "runner"
+      (x.root == "runners"
         && x.entry.serverAddressEnv != null
         && target != null
         && (servers ? ${target}))
@@ -276,8 +283,8 @@ let
   secretNamesOf = x:
     lib.unique (lib.mapAttrsToList (_: d: d.secret) x.w.credentials ++ x.w.envFromSecrets);
 
-  secretNamesOfPlane = plane:
-    lib.unique (lib.concatMap secretNamesOf (lib.filter (x: planeOf x == plane) allWorkloads));
+  secretNamesOfPlane = workloads: plane:
+    lib.unique (lib.concatMap secretNamesOf (lib.filter (x: planeOf x == plane) workloads));
 
   ## ---------------------------------------------------------------------
   ## Probes and addressing
@@ -298,31 +305,17 @@ let
       slot = x.w.slot or null;
     };
 
-  mkGrammarApp = x:
-    {
-      namespace = namespaceOf x;
-      inherit (x.w) createNamespace project;
-      exposure = exposureOf x;
-      image = imageOf x;
-      ports = portsOf x;
+  # The factory owns the universal image/app projection, including ports, probes, addressing and
+  # catalogue `singleWriter`. CI keeps only its domain-specific volume, Secret and two-plane wiring.
+  # In particular, this now projects `woodpecker-agent.singleWriter = true`; the old hand-written
+  # translator accidentally omitted that catalogue fact and could roll a claim-backed agent.
+  extendApp = x:
+    x.app // {
       state = stateOf x;
       secrets = secretsOf x;
       env = x.entry.env // cacheEnvOf x // forgeEnvOf x // serverAddressOf x // x.w.env;
       args = x.entry.args ++ x.w.args;
-      probes = probesOf x;
-    }
-    // addressingOf x;
-
-  mkDirectApp = x: {
-    namespace = namespaceOf x;
-    inherit (x.w) project;
-    # Never here: the Namespace this renderer creates carries no protection against being read as
-    # no-longer-desired, and a CI namespace holds the forge's repositories. Asserted below.
-    createNamespace = false;
-    yamls = x.w.manifests;
-    syncPolicy.syncOptions.serverSideApply = true;
-    compareOptions.serverSideDiff = true;
-  };
+    };
 
   ## ---------------------------------------------------------------------
   ## Derived facts the guards are written against
@@ -332,24 +325,27 @@ let
   exposureOf = x: x.w.exposure or "internal";
   showSlot = x: if slotOf x == null then "(none)" else toString (slotOf x);
 
-  slotClaims = lib.filter (x: slotOf x != null) allWorkloads;
-  claimantsOf = slot: map (x: x.name) (lib.filter (x: slotOf x == slot) slotClaims);
-  duplicatedSlots =
-    lib.filter (slot: lib.length (claimantsOf slot) > 1)
-      (lib.unique (map slotOf slotClaims));
+  slotClaims = workloads: lib.filter (x: slotOf x != null) workloads;
+  claimantsOf = workloads: slot:
+    map (x: x.name) (lib.filter (x: slotOf x == slot) (slotClaims workloads));
+  duplicatedSlots = workloads:
+    lib.filter (slot: lib.length (claimantsOf workloads slot) > 1)
+      (lib.unique (map slotOf (slotClaims workloads)));
 
-  creatorsOf = ns:
-    map (x: x.name) (lib.filter (x: x.w.createNamespace && namespaceOf x == ns) allWorkloads);
-  createdNamespaces =
-    lib.unique (map namespaceOf (lib.filter (x: x.w.createNamespace) allWorkloads));
+  creatorsOf = workloads: ns:
+    map (x: x.name)
+      (lib.filter (x: x.w.createNamespace && namespaceOf x == ns) workloads);
+  createdNamespaces = workloads:
+    lib.unique (map namespaceOf (lib.filter (x: x.w.createNamespace) workloads));
 
   # THE PLANE GUARD's raw material: which workloads on each plane name a given Secret.
-  namersOf = plane: secret:
+  namersOf = workloads: plane: secret:
     map (x: x.name)
-      (lib.filter (x: planeOf x == plane && lib.elem secret (secretNamesOf x)) allWorkloads);
-  crossPlaneSecrets =
-    lib.filter (s: namersOf "control" s != [ ] && namersOf "execution" s != [ ])
-      (lib.unique (lib.concatMap secretNamesOf allWorkloads));
+      (lib.filter (x: planeOf x == plane && lib.elem secret (secretNamesOf x)) workloads);
+  crossPlaneSecrets = workloads:
+    lib.filter
+      (s: namersOf workloads "control" s != [ ] && namersOf workloads "execution" s != [ ])
+      (lib.unique (lib.concatMap secretNamesOf workloads));
 
   ## ---------------------------------------------------------------------
   ## Assertions
@@ -383,7 +379,7 @@ let
     ++ lib.optional w.createNamespace "createNamespace"
     ++ lib.optional ((w.slot or null) != null) "slot";
 
-  deliveryAssertions = lib.concatMap
+  deliveryAssertions = allWorkloads: lib.concatMap
     (x:
       let inherit (x) name w entry; in
       [
@@ -431,7 +427,7 @@ let
       ])
     allWorkloads;
 
-  storageAssertions = lib.concatMap
+  storageAssertions = allWorkloads: lib.concatMap
     (x:
       let inherit (x) name w entry; in
       [
@@ -471,7 +467,7 @@ let
       ])
     allWorkloads;
 
-  credentialAssertions = lib.concatMap
+  credentialAssertions = allWorkloads: lib.concatMap
     (x:
       let
         inherit (x) name w entry;
@@ -500,7 +496,7 @@ let
       ])
     allWorkloads;
 
-  serverAssertions = lib.concatMap
+  serverAssertions = allWorkloads: lib.concatMap
     (x:
       let inherit (x) name w entry; in
       [
@@ -532,9 +528,9 @@ let
             + "rather than its in-cluster name.";
         }
       ])
-    (workloadsOfKind "server");
+    (workloadsOfKind "server" allWorkloads);
 
-  runnerAssertions = lib.concatMap
+  runnerAssertions = allWorkloads: lib.concatMap
     (x:
       let inherit (x) name w entry; in
       [
@@ -591,9 +587,9 @@ let
             + "believe something reconciles this pool.";
         }
       ])
-    (workloadsOfKind "runner");
+    (workloadsOfKind "runner" allWorkloads);
 
-  jobAssertions = map
+  jobAssertions = allWorkloads: map
     (x: {
       assertion = x.w.manifests != [ ];
       message =
@@ -602,11 +598,11 @@ let
         + "exactly like a chart's. With none, the declaration renders an Application with nothing in it "
         + "and nothing ever fires.";
     })
-    (workloadsOfKind "job");
+    (workloadsOfKind "job" allWorkloads);
 
   # THE ORDERING GUARD. One pair at a time, so the refusal names both workloads and both numbers
   # rather than reporting that something, somewhere, is out of order.
-  orderingAssertions = lib.concatMap
+  orderingAssertions = allWorkloads: lib.concatMap
     (server: map
       (forge: {
         assertion =
@@ -621,25 +617,25 @@ let
       })
       (lib.filter
         (f: f.name == server.w.forge && f.entry.hosted)
-        (workloadsOfKind "forge")))
-    (workloadsOfKind "server");
+        (workloadsOfKind "forge" allWorkloads)))
+    (workloadsOfKind "server" allWorkloads);
 
-  planeAssertions =
+  planeAssertions = allWorkloads:
     # THE LOAD-BEARING INVARIANT OF THIS REPOSITORY.
     map
       (secret: {
         assertion = false;
         message =
           "nixci: Secret `${secret}` is named by workloads on BOTH planes -- "
-          + listNames (namersOf "control" secret) + " in the control plane and "
-          + listNames (namersOf "execution" secret) + " in the execution plane. The execution plane runs "
+          + listNames (namersOf allWorkloads "control" secret) + " in the control plane and "
+          + listNames (namersOf allWorkloads "execution" secret) + " in the execution plane. The execution plane runs "
           + "code somebody pushed, and the whole reason it is a separate plane is that it receives a "
           + "NARROWER credential than the control plane holds: a server and the runner it hands work to "
           + "share one secret VALUE and must never share one Secret object. Unseal a second Secret, in the "
           + "execution namespace, carrying only what the runner needs.";
       })
-      crossPlaneSecrets
-    ++ lib.optional (onControl != [ ] && onExecution != [ ]) {
+      (crossPlaneSecrets allWorkloads)
+    ++ lib.optional (onControl allWorkloads != [ ] && onExecution allWorkloads != [ ]) {
       assertion = platform.controlNamespace != platform.executionNamespace;
       message =
         "nixci: `nixci.platform.controlNamespace` and `nixci.platform.executionNamespace` are the same "
@@ -649,25 +645,27 @@ let
         + "execution plane its own namespace.";
     };
 
-  tierAssertions =
+  tierAssertions = allWorkloads:
     map
       (slot: {
         assertion = false;
         message =
-          "nixci: slot ${toString slot} is claimed by more than one workload: " + listNames (claimantsOf slot)
+          "nixci: slot ${toString slot} is claimed by more than one workload: "
+          + listNames (claimantsOf allWorkloads slot)
           + ". A slot is one identity in every address space the fleet maps it into, so two claimants is a "
           + "collision in all of them at once.";
       })
-      duplicatedSlots
+      (duplicatedSlots allWorkloads)
     ++ map
       (ns: {
-        assertion = lib.length (creatorsOf ns) == 1;
+        assertion = lib.length (creatorsOf allWorkloads ns) == 1;
         message =
-          "nixci: namespace `${ns}` is created by more than one workload: " + listNames (creatorsOf ns)
+          "nixci: namespace `${ns}` is created by more than one workload: "
+          + listNames (creatorsOf allWorkloads ns)
           + ". Two Applications owning one Namespace fight over it. Let exactly one anchor it, or anchor it "
           + "in the tenancy layer and set `createNamespace = false` on all of them.";
       })
-      createdNamespaces
+      (createdNamespaces allWorkloads)
     ++ map
       (x: {
         # Lesson paid for elsewhere and encoded here: a Namespace created by an Application that this
@@ -686,7 +684,7 @@ let
   ## Warnings
   ## ---------------------------------------------------------------------
 
-  warnings =
+  warnings = allWorkloads:
     map
       (x: {
         when = x.w.manifests == [ ];
@@ -697,7 +695,7 @@ let
           + "controller is present, and the credential split is still checked). If it was meant to be "
           + "delivered from here, it is not.";
       })
-      (lib.filter (x: deliveryOf x == "chart" && x.kind != "job") allWorkloads)
+      (lib.filter (x: deliveryOf x == "chart" && x.legacyKind != "job") allWorkloads)
     ++ map
       (x: {
         when = exposureOf x != "internal";
@@ -725,7 +723,7 @@ let
           + "store, an empty registry, nothing compiled. That is a correct configuration and an expensive "
           + "one, and it is the single difference between this runner shape and a pod-per-step one.";
       })
-      (workloadsOfKind "runner");
+      (workloadsOfKind "runner" allWorkloads);
 
   ## ---------------------------------------------------------------------
   ## Option shapes
@@ -973,550 +971,283 @@ let
 
   controlOptions = sharedOptions // reachableOptions;
 
-  mkKind = { extra, description, example }: lib.mkOption {
-    default = { };
-    inherit description example;
-    type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
-      options = controlOptions // extra;
-    }));
+  # These common terms did not exist in nixci's public declaration schema. Image, state and
+  # credentials are deliberately redeclared below in their legacy shapes: the factory still owns
+  # image rendering, while nixci retains the exact state and credential role contracts.
+  legacyDisabledOptions = [
+    "companionImages"
+    "companionResources"
+    "initImages"
+    "objectName"
+    "replicas"
+    "image"
+    "namespace"
+    "scaling"
+    "wake"
+    "adopt"
+    "harden"
+    "state"
+    "probes"
+    "resources"
+    "credentials"
+    "requires"
+    "publicUrl"
+    "identity"
+  ];
+
+  # Execution-plane declarations structurally have neither term. Keeping them disabled makes
+  # writing either one an unknown-option error, as it was before the migration.
+  runnerDisabledOptions = legacyDisabledOptions ++ [ "exposure" "slot" ];
+
+  serverOptions = {
+    forge = lib.mkOption {
+      type = lib.types.str;
+      description = ''
+        Name of the declared forge this server authenticates through and reads repositories from.
+      '';
+    };
+    forgeUrl = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "https://forge.example.com";
+      description = "Public URL of a self-hosted forge used for the OAuth handshake.";
+    };
+  };
+
+  runnerOptions = {
+    serves = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Declaration this runner connects out to: a server, a forge, or null for an external
+        control plane, according to the selected catalogue entry.
+      '';
+    };
+    controller = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Declared control-plane controller that reconciles this runner pool.";
+    };
+  };
+
+  jobOptions.schedule = lib.mkOption {
+    type = lib.types.str;
+    example = "0 4 * * *";
+    description = "When this platform job fires, in the notation used by its delivered object.";
+  };
+
+  routeOf = { entry, ... }:
+    if entry.delivery == "image" then "app"
+    else if entry.delivery == "chart" then "manifest"
+    else "reference";
+
+  legacyAssertions = workloads:
+    let all = orderedWorkloads workloads;
+    in
+    deliveryAssertions all
+    ++ storageAssertions all
+    ++ credentialAssertions all
+    ++ serverAssertions all
+    ++ runnerAssertions all
+    ++ jobAssertions all
+    ++ orderingAssertions all
+    ++ planeAssertions all
+    ++ tierAssertions all;
+
+  legacyWarnings = workloads: warnings (orderedWorkloads workloads);
+
+  reportsOf = workloads:
+    let
+      all = orderedWorkloads workloads;
+      control = onControl all;
+      execution = onExecution all;
+      claims = slotClaims all;
+      chartsIn = lib.filter
+        (x: deliveryOf x == "chart" && x.entry.chart != null)
+        all;
+      chartWorkloads = lib.filter (x: deliveryOf x == "chart") all;
+      controlledRunners = lib.filter
+        (x:
+          x.legacyKind == "runner"
+          && x.w.controller != null
+          && (controllers ? ${x.w.controller}))
+        all;
+      reportJobs = workloadsOfKind "job" all;
+    in
+    {
+      nixci = {
+        controlPlane = map (x: x.name) control;
+        executionPlane = map (x: x.name) execution;
+        controlSecrets = secretNamesOfPlane all "control";
+        executionSecrets = secretNamesOfPlane all "execution";
+
+        crossPlaneBindings = lib.listToAttrs (map
+          (x: lib.nameValuePair x.name {
+            controller = x.w.controller;
+            namespace = platform.controlNamespace;
+            serviceAccount = builtins.replaceStrings [ "{RELEASE}" ] [ x.w.controller ]
+              catalogue.controllers.${controllers.${x.w.controller}.controller}.serviceAccount;
+          })
+          controlledRunners);
+
+        charts = lib.listToAttrs
+          (map (x: lib.nameValuePair x.name x.entry.chart) chartsIn);
+
+        chartCredentials = lib.listToAttrs (map
+          (x: lib.nameValuePair x.name
+            (lib.mapAttrs (_: d: d.secret)
+              (lib.filterAttrs
+                (role: _:
+                  (x.entry.credentials.${role} or null) != null
+                  && x.entry.credentials.${role}.env == null)
+                x.w.credentials)))
+          chartWorkloads);
+
+        schedules = lib.listToAttrs
+          (map (x: lib.nameValuePair x.name x.w.schedule) reportJobs);
+
+        slots = lib.listToAttrs
+          (map (x: lib.nameValuePair x.name (slotOf x)) claims);
+      };
+    };
+
+  reportOptions = {
+    controlPlane = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      readOnly = true;
+      description = "Workloads in the control plane. No repo code runs in any of them.";
+    };
+    executionPlane = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      readOnly = true;
+      description = "Workloads in the execution plane, where repository code runs.";
+    };
+    controlSecrets = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      readOnly = true;
+      description = "Secret names referenced by control-plane workloads.";
+    };
+    executionSecrets = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      readOnly = true;
+      description = "Secret names referenced by execution-plane workloads.";
+    };
+    crossPlaneBindings = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.attrsOf lib.types.str);
+      readOnly = true;
+      description = "Runner pool to its derived control-plane controller coordinates.";
+    };
+    charts = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.attrsOf lib.types.str);
+      readOnly = true;
+      description = "Workload to the upstream chart coordinates that deliver it.";
+    };
+    chartCredentials = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.attrsOf lib.types.str);
+      readOnly = true;
+      description = "Chart workload credential role to existing Secret name.";
+    };
+    schedules = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      readOnly = true;
+      description = "Scheduled platform job to when it fires.";
+    };
+    slots = lib.mkOption {
+      type = lib.types.attrsOf lib.types.ints.unsigned;
+      readOnly = true;
+      description = "Control-plane workload to the fleet slot it claims.";
+    };
+  };
+
+  commonRoot = {
+    disabledOptions = legacyDisabledOptions;
+    inherit namespaceOf;
+    kind = routeOf;
+    nameOf = { name, ... }: name;
+    extend = extendApp;
+  };
+
+  factoryModule = mkConsumerModule {
+    namespace = "nixci";
+    optionPath = [ "nixci" ];
+    platformOption = "platform";
+
+    extraPlatformOptions = {
+      controlNamespace = lib.mkOption {
+        type = lib.types.str;
+        description = ''
+          Namespace for every control-plane workload. It has no default and no per-workload
+          override.
+        '';
+      };
+      executionNamespace = lib.mkOption {
+        type = lib.types.str;
+        description = ''
+          Namespace for every execution-plane workload. It must differ from the control namespace.
+        '';
+      };
+      clusterDomain = lib.mkOption {
+        type = lib.types.str;
+        default = "cluster.local";
+        description = "Internal DNS domain used to derive the server address runners dial.";
+      };
+    };
+
+    extraNamespaceOptions = reportOptions;
+
+    roots = {
+      forges = commonRoot // {
+        catalogue = catalogue.forges;
+        selector = "forge";
+        extraOptions = controlOptions;
+        description = ''
+          Git forges, keyed by a declaration name. A remotely operated forge is a checked reference
+          and deliberately renders nothing.
+        '';
+      };
+      servers = commonRoot // {
+        catalogue = catalogue.servers;
+        selector = "server";
+        extraOptions = controlOptions // serverOptions;
+        description = "CI servers and their declared forge relationship.";
+      };
+      caches = commonRoot // {
+        catalogue = catalogue.caches;
+        selector = "cache";
+        extraOptions = controlOptions;
+        description = "Control-plane artifact caches.";
+      };
+      controllers = commonRoot // {
+        catalogue = catalogue.controllers;
+        selector = "controller";
+        extraOptions = controlOptions;
+        description = "Control-plane controllers that reconcile execution-plane runner pools.";
+      };
+      runners = commonRoot // {
+        catalogue = catalogue.runners;
+        selector = "runner";
+        disabledOptions = runnerDisabledOptions;
+        extraOptions = sharedOptions // runnerOptions;
+        description = ''
+          Execution-plane runners. This root structurally has no exposure or slot option and renders
+          no inbound Service.
+        '';
+      };
+      jobs = commonRoot // {
+        entry = jobEntry;
+        extraOptions = controlOptions // jobOptions;
+        description = "Fixed-root scheduled control-plane work delivered as whole manifests.";
+      };
+    };
+
+    extraAssertions = legacyAssertions;
+    extraWarnings = legacyWarnings;
+    extraConfig = reportsOf;
   };
 in
 {
-  options.nixci.platform = {
-    controlNamespace = lib.mkOption {
-      type = lib.types.str;
-      description = ''
-        The namespace every CONTROL-PLANE workload lands in: the forge, the CI server, the cache,
-        the runner controllers, the schedules. NO DEFAULT, and evaluation fails naming this option
-        the moment any of them is declared.
+  imports = [ factoryModule ];
 
-        There is no per-workload override anywhere in this module, and that is the separation being
-        structural rather than advisory: a workload's namespace is its plane's, and its plane is a
-        property of the software. What a cluster calls this namespace is a value.
-      '';
-    };
-
-    executionNamespace = lib.mkOption {
-      type = lib.types.str;
-      description = ''
-        The namespace every EXECUTION-PLANE workload lands in: every runner, and the warm builder.
-        This is where code somebody pushed actually runs.
-
-        It must differ from `controlNamespace`, and eval fails when it does not, because the split
-        is what makes the credential split possible: one Secret set unseals into each namespace, and
-        the execution plane's holds nothing but what a runner needs to say hello.
-      '';
-    };
-
-    project = lib.mkOption {
-      type = lib.types.str;
-      default = "default";
-      description = ''
-        Delivery project every workload lands in unless it says otherwise.
-
-        Defaults to `default` -- the delivery tool's own built-in project, which permits every
-        destination and is therefore the answer that cannot break a render. It is not the answer to
-        leave in place: name a project of your own so the platform is governed like everything else,
-        and note that ONE project spanning both namespaces is the usual shape here, because the two
-        planes are one subsystem delivered together.
-      '';
-    };
-
-    clusterDomain = lib.mkOption {
-      type = lib.types.str;
-      default = "cluster.local";
-      description = ''
-        The cluster's internal DNS domain, used to build the ONE address that crosses between the
-        planes: the CI server endpoint a runner dials. Defaulted, unlike the namespaces, because it
-        is a Kubernetes default rather than a fleet fact -- but it is an option because a cluster
-        installed with a different one would otherwise get an address that resolves nowhere.
-      '';
-    };
-
-    origin = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      example = "nixci";
-      description = ''
-        The declaring-origin name to stamp on the workloads the app grammar renders, handing their
-        slots to the BAND MODEL -- which governs which range of the identity space a declaring
-        repository's workloads may take a number from.
-
-        `null` by default because `origin` and `slot` are that model's terms: defining them into a
-        render that does not include it fails with "the option does not exist". Set this only when
-        it is part of the same render, and set it to the name that model binds a band for.
-
-        Execution-plane workloads are stamped with the origin and no number, which is what the band
-        model wants for a workload that renders no Service: it asks for a slot only from something
-        with an in-cluster address, and a runner deliberately has none.
-      '';
-    };
-  };
-
-  options.nixci.forges = mkKind {
-    description = ''
-      Git forges, keyed by a name of your choosing. A forge is CI's CODE-HOSTING HALF -- where the
-      repositories live, what fires the trigger, and the identity the CI server authenticates
-      through -- which is why it is declared in this repository rather than beside it.
-
-      A forge somebody else runs is declared here too, as a reference: it renders no object at all
-      and exists to be named by the workloads that depend on it.
-    '';
-    example = lib.literalExpression ''
-      {
-        example-forge = {
-          forge = "forgejo";
-          version = "0.0.0";
-          slot = 65;                       # below the server that logs in through it
-          exposure = "public";
-          state = {
-            data.hostPath   = "/example/state/forge/data";
-            config.hostPath = "/example/state/forge/config";
-            lfs.hostPath    = "/example/state/forge/lfs";
-          };
-        };
-
-        # Somebody else's forge. Renders nothing; a runner may still name it.
-        example-remote-forge.forge = "github";
-      }
-    '';
-    extra = {
-      forge = lib.mkOption {
-        type = lib.types.enum (lib.attrNames catalogue.forges);
-        description = "Which forge, from the catalogue. Available: ${lib.concatStringsSep ", " (lib.attrNames catalogue.forges)}.";
-      };
-    };
-  };
-
-  options.nixci.servers = mkKind {
-    description = ''
-      CI servers, keyed by a name of your choosing. The web UI, the API, and the endpoint runners
-      dial. A CI server runs no pipeline step itself, which is exactly why it can hold the
-      platform's credentials.
-
-      Each names the forge it authenticates through, and that forge must be declared: the login and
-      the repository connection are one relationship, so a server pointing at an undeclared forge is
-      a server nobody can sign in to.
-    '';
-    example = lib.literalExpression ''
-      {
-        example-server = {
-          server = "crow";
-          version = "0.0.0";
-          slot = 66;                            # above the forge it logs in through
-          exposure = "nb";
-          forge = "example-forge";
-          forgeUrl = "https://forge.example.com";
-          state.data.hostPath = "/example/state/ci-server";
-          credentials = {
-            forgeClient = { secret = "example-ci-forge-oauth"; key = "client"; };
-            forgeSecret = { secret = "example-ci-forge-oauth"; key = "secret"; };
-            agentSecret = { secret = "example-ci-forge-oauth"; key = "agent"; };
-          };
-        };
-      }
-    '';
-    extra = {
-      server = lib.mkOption {
-        type = lib.types.enum (lib.attrNames catalogue.servers);
-        description = "Which CI server, from the catalogue. Available: ${lib.concatStringsSep ", " (lib.attrNames catalogue.servers)}.";
-      };
-
-      forge = lib.mkOption {
-        type = lib.types.str;
-        description = ''
-          NAME of the declared forge this server authenticates through and reads repositories from.
-          Required, and defaulted nowhere: a CI server without a forge has no source of pipelines
-          and no way for anybody to log in.
-        '';
-      };
-
-      forgeUrl = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        example = "https://forge.example.com";
-        description = ''
-          The forge's URL, as a browser reaches it. A fleet fact, which is why it is here rather
-          than in the catalogue -- the VARIABLE it arrives in is knowledge and comes from the
-          catalogue entry.
-
-          It is the PUBLIC address rather than the in-cluster one, because it is where the OAuth
-          handshake redirects a browser. Required when the forge is self-hosted (nobody could
-          default it); optional for a remote forge, which the server already knows how to find.
-        '';
-      };
-    };
-  };
-
-  options.nixci.caches = mkKind {
-    description = ''
-      Artifact caches, keyed by a name of your choosing. Where builds land and what serves them
-      back: the third thing a CI platform is made of, after somewhere to keep the code and something
-      to run the builds.
-
-      A cache is a CONTROL-plane workload even though its contents come from the execution plane,
-      because serving artifacts is not running them. The write face is a separate concern -- see the
-      catalogue's own notes, which are explicit about which half of a cache each entry is.
-    '';
-    example = lib.literalExpression ''
-      {
-        example-cache = {
-          cache = "nar-http";
-          version = "0.0.0";
-          slot = 67;
-          state.store.hostPath = "/example/artifacts/store";   # mounted read-only; the catalogue says so
-        };
-      }
-    '';
-    extra = {
-      cache = lib.mkOption {
-        type = lib.types.enum (lib.attrNames catalogue.caches);
-        description = "Which cache, from the catalogue. Available: ${lib.concatStringsSep ", " (lib.attrNames catalogue.caches)}.";
-      };
-    };
-  };
-
-  options.nixci.controllers = mkKind {
-    description = ''
-      Runner controllers, keyed by a name of your choosing. A controller reconciles a declared
-      runner pool into actual runner pods and removes them again when the work is done.
-
-      IT IS A CONTROL-PLANE WORKLOAD WHOSE BLAST RADIUS IS THE EXECUTION PLANE. It runs no repo code
-      and holds no registration token; it creates every pod that does. This module publishes the
-      coordinates a runner pool needs in order to bind back to it -- see `nixci.crossPlaneBindings`
-      -- so that nobody has to write the controller's namespace into an execution-plane declaration.
-    '';
-    example = lib.literalExpression ''
-      {
-        example-controller = {
-          controller = "arc";
-          slot = 68;
-          manifests = [ (builtins.readFile ./rendered-controller-chart.yaml) ];
-        };
-      }
-    '';
-    extra = {
-      controller = lib.mkOption {
-        type = lib.types.enum (lib.attrNames catalogue.controllers);
-        description = "Which controller, from the catalogue. Available: ${lib.concatStringsSep ", " (lib.attrNames catalogue.controllers)}.";
-      };
-    };
-  };
-
-  options.nixci.jobs = lib.mkOption {
-    default = { };
-    description = ''
-      Scheduled work, keyed by a name of your choosing. A CONTROL-plane kind: it is the thing that
-      DECIDES to run, not the thing that runs.
-
-      That distinction is the whole rule for this option. A schedule that builds a repository
-      belongs in a pipeline the CI server triggers, so that the build happens where builds happen;
-      what belongs here is the schedule whose work is the platform's own -- rotating something,
-      sweeping something, bumping a lock file.
-
-      A schedule is not a running process, so the app grammar has no term for it and its object is
-      taken as a value, exactly like a chart's. Every one of these appears in `nixci.schedules`,
-      because the set of things that fire on a timer holding control-plane credentials is precisely
-      the set somebody should be able to read in one place.
-    '';
-    example = lib.literalExpression ''
-      {
-        example-nightly = {
-          schedule = "0 4 * * *";
-          manifests = [ (builtins.readFile ./nightly-cronjob.yaml) ];
-        };
-      }
-    '';
-    type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
-      options = controlOptions // {
-        schedule = lib.mkOption {
-          type = lib.types.str;
-          example = "0 4 * * *";
-          description = ''
-            WHEN this fires, in the notation the object you deliver uses. Nothing here renders it --
-            the schedule inside the object is what actually fires -- and it is required anyway,
-            because it is what makes `nixci.schedules` a readable answer to "what runs on a timer in
-            this platform, and how often". A field that only feeds a report is still a field that
-            decides something.
-          '';
-        };
-      };
-    }));
-  };
-
-  options.nixci.runners = lib.mkOption {
-    default = { };
-    description = ''
-      Runners, keyed by a name of your choosing. THE EXECUTION PLANE: pipeline steps run here, as
-      processes inside the pod for a warm runner or as pods it creates for a scheduling one. This is
-      where code somebody pushed executes.
-
-      Everything about this option's shape follows from that. There is no `exposure` and no `slot`
-      -- a runner dials out and nothing dials in, and no catalogue entry on this plane declares a
-      port, so the app grammar renders NO SERVICE for any of them. There is no `namespace`, because
-      the plane decides it. And a Secret named here may not be named in the control plane, which is
-      what keeps the forge's OAuth client secret out of reach of a build script.
-
-      Running SEVERAL runner systems at once is a real state rather than a transitional one: a warm
-      builder for the repositories that benefit from a hot cache, an ephemeral pool for the ones
-      whose pipelines are written for somebody else's CI.
-    '';
-    example = lib.literalExpression ''
-      {
-        # A warm builder: steps run as processes in this pod, on caches that survive between builds.
-        example-builder = {
-          runner = "crow-agent";
-          version = "0.0.0";
-          serves = "example-server";                         # the address is DERIVED from this
-          state.workspaces.hostPath = "/example/build/workspaces";
-          caches = {
-            nix.hostPath   = "/example/build/store";
-            cargo.hostPath = "/example/build/cargo";
-          };
-          credentials.agentSecret = { secret = "example-runner-agent"; key = "agent"; };
-        };
-
-        # An ephemeral pool for a remote forge, reconciled by a controller in the OTHER plane.
-        example-pool = {
-          runner = "gha-scale-set";
-          serves = "example-remote-forge";
-          controller = "example-controller";
-          manifests = [ (builtins.readFile ./rendered-pool-chart.yaml) ];
-          credentials.forgeToken = { secret = "example-pool-token"; key = "github_token"; };
-        };
-      }
-    '';
-    type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
-      # NO `reachableOptions`. See this module's header: an execution-plane workload has no
-      # exposure class and no slot, and writing either is an unknown-option error.
-      options = sharedOptions // {
-        runner = lib.mkOption {
-          type = lib.types.enum (lib.attrNames catalogue.runners);
-          description = "Which runner system, from the catalogue. Available: ${lib.concatStringsSep ", " (lib.attrNames catalogue.runners)}.";
-        };
-
-        serves = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-          description = ''
-            WHAT this runner connects out to, by the name of a declaration in this platform: a
-            declared CI server for a runner that dials one, or a declared forge for a pool that
-            registers against one. Which of the two is the catalogue's to say.
-
-            `null` is the correct answer for a runner whose control plane is a vendor's service on
-            the internet -- this repository models that as absence rather than inventing a group for
-            it, and the absence is the accurate statement.
-
-            For a runner that dials a CI server, THE ADDRESS IS DERIVED FROM THIS and never
-            supplied: the server's own name, the control plane's namespace and the port its
-            catalogue entry says agents dial. It is the one thing that crosses between the planes,
-            and deriving it is what fixes the direction.
-          '';
-        };
-
-        controller = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-          description = ''
-            NAME of the declared controller that reconciles this pool, for a runner system that has
-            one. The controller lives in the CONTROL plane; this module derives its namespace and
-            its ServiceAccount and publishes the pair at `nixci.crossPlaneBindings`, so an
-            execution-plane declaration never writes a control-plane namespace down.
-
-            Naming none where one is required is refused, because the failure otherwise is the worst
-            kind available: every object applies, everything reports healthy, and no runner ever
-            registers.
-          '';
-        };
-      };
-    }));
-  };
-
-  # ── Computed, read-only ───────────────────────────────────────────────────────────────────────
-
-  options.nixci.controlPlane = lib.mkOption {
-    type = lib.types.listOf lib.types.str;
-    readOnly = true;
-    default = map (x: x.name) onControl;
-    defaultText = lib.literalExpression "computed from the declared workloads";
-    description = "Workloads in the control plane. No repo code runs in any of them.";
-  };
-
-  options.nixci.executionPlane = lib.mkOption {
-    type = lib.types.listOf lib.types.str;
-    readOnly = true;
-    default = map (x: x.name) onExecution;
-    defaultText = lib.literalExpression "computed from the declared workloads";
-    description = ''
-      Workloads in the execution plane: every runner, and the warm builder. Pipeline steps run in
-      these. Read-only, and the point of it is that it is COUNTABLE -- this is the list of places
-      where untrusted code executes, and a boundary nobody measures becomes the architecture.
-    '';
-  };
-
-  options.nixci.controlSecrets = lib.mkOption {
-    type = lib.types.listOf lib.types.str;
-    readOnly = true;
-    default = secretNamesOfPlane "control";
-    defaultText = lib.literalExpression "every Secret named by a control-plane workload";
-    description = ''
-      Secret NAMES the control plane references. Together with `executionSecrets` this is the
-      credential split, stated as data: the two lists must be disjoint, eval fails when they are
-      not, and a reader can check the claim rather than believe it.
-    '';
-  };
-
-  options.nixci.executionSecrets = lib.mkOption {
-    type = lib.types.listOf lib.types.str;
-    readOnly = true;
-    default = secretNamesOfPlane "execution";
-    defaultText = lib.literalExpression "every Secret named by an execution-plane workload";
-    description = ''
-      Secret NAMES the execution plane references -- everything a build script could reach. It
-      should be short, and it should contain nothing that grants access to anything but the CI
-      server's front door.
-    '';
-  };
-
-  options.nixci.crossPlaneBindings = lib.mkOption {
-    type = lib.types.attrsOf (lib.types.attrsOf lib.types.str);
-    readOnly = true;
-    default = lib.listToAttrs
-      (map
-        (x: lib.nameValuePair x.name {
-          controller = x.w.controller;
-          namespace = platform.controlNamespace;
-          serviceAccount = builtins.replaceStrings [ "{RELEASE}" ] [ x.w.controller ]
-            catalogue.controllers.${controllers.${x.w.controller}.controller}.serviceAccount;
-        })
-        (lib.filter
-          (x: x.kind == "runner" && x.w.controller != null && (controllers ? ${x.w.controller}))
-          allWorkloads));
-    defaultText = lib.literalExpression "runner -> the control-plane controller it binds back to";
-    description = ''
-      runner pool -> `{ controller, namespace, serviceAccount }` for the controller that reconciles
-      it, at its control-plane home. Published rather than rendered, because what consumes it is the
-      pool's own chart values and a role binding in the execution namespace.
-
-      THE POINT IS WHICH FIELDS ARE DERIVED. A pool names its controller; it never names the
-      controller's namespace or its ServiceAccount, because both follow from the controller's plane
-      and from its chart. A pool pointed at the wrong account fails by never being reconciled --
-      objects apply, nothing is degraded, no runner appears -- which is exactly the failure a
-      derived value cannot produce.
-    '';
-  };
-
-  options.nixci.charts = lib.mkOption {
-    type = lib.types.attrsOf (lib.types.attrsOf lib.types.str);
-    readOnly = true;
-    default = lib.listToAttrs
-      (map (x: lib.nameValuePair x.name x.entry.chart)
-        (lib.filter (x: deliveryOf x == "chart" && x.entry.chart != null) allWorkloads));
-    defaultText = lib.literalExpression "the upstream chart coordinates of every chart-delivered workload";
-    description = ''
-      workload -> `{ repo, name }` for the upstream Helm chart that delivers it. Published rather
-      than rendered, and WITHOUT a version, because a version and its digest change every release
-      and are pinned by whoever renders the chart -- a copy here would be a second pin that nothing
-      keeps honest.
-    '';
-  };
-
-  options.nixci.chartCredentials = lib.mkOption {
-    type = lib.types.attrsOf (lib.types.attrsOf lib.types.str);
-    readOnly = true;
-    default = lib.listToAttrs
-      (map
-        (x: lib.nameValuePair x.name
-          (lib.mapAttrs (_: d: d.secret)
-            (lib.filterAttrs
-              (role: _: (x.entry.credentials.${role} or null) != null
-                && x.entry.credentials.${role}.env == null)
-              x.w.credentials)))
-        (lib.filter (x: deliveryOf x == "chart") allWorkloads));
-    defaultText = lib.literalExpression "role -> Secret name, for every chart-delivered workload";
-    description = ''
-      chart-delivered workload -> `role -> Secret name`. A chart's credential is consumed BY NAME
-      through its own values rather than as an environment reference this module renders, so it is
-      published instead of injected. Nothing here pretends to wire it: the consumer passes the name
-      into the chart values it renders, and the cross-plane guard still counts it.
-    '';
-  };
-
-  options.nixci.schedules = lib.mkOption {
-    type = lib.types.attrsOf lib.types.str;
-    readOnly = true;
-    default = lib.mapAttrs (_: w: w.schedule) jobs;
-    defaultText = lib.literalExpression "every declared scheduled job";
-    description = ''
-      job -> when it fires. The set of things that run on a timer in the control plane, in one
-      readable place, because that set is exactly what nobody remembers and what holds the
-      platform's own credentials.
-    '';
-  };
-
-  options.nixci.slots = lib.mkOption {
-    type = lib.types.attrsOf lib.types.ints.unsigned;
-    readOnly = true;
-    default = lib.listToAttrs (map (x: lib.nameValuePair x.name (slotOf x)) slotClaims);
-    defaultText = lib.literalExpression "every declared workload that claims a slot";
-    description = ''
-      workload -> the position it claims. Control-plane workloads only, structurally: there is no
-      slot option on the execution plane, so a runner can never appear here.
-    '';
-  };
-
-  options.nixci.renderedByGrammar = lib.mkOption {
-    type = lib.types.listOf lib.types.str;
-    readOnly = true;
-    default = map (x: x.name) byGrammar;
-    defaultText = lib.literalExpression "computed from the declared workloads";
-    description = "Workloads rendered through the app grammar, in full.";
-  };
-
-  options.nixci.renderedDirectly = lib.mkOption {
-    type = lib.types.listOf lib.types.str;
-    readOnly = true;
-    default = map (x: x.name) directly;
-    defaultText = lib.literalExpression "computed from the declared workloads";
-    description = ''
-      Workloads rendered one level BELOW the app grammar, because what they deliver is a whole
-      object rather than a container -- a vendor's chart output, or a schedule.
-
-      Read-only, and the point of it is that it is COUNTABLE: this is the platform's untyped
-      surface, and a boundary nobody measures becomes the architecture.
-    '';
-  };
-
-  options.nixci.notRendered = lib.mkOption {
-    type = lib.types.listOf lib.types.str;
-    readOnly = true;
-    default = map (x: x.name) notRendered;
-    defaultText = lib.literalExpression "every declared reference";
-    description = ''
-      Declarations that render NO object at all -- a forge somebody else runs. They are declared so
-      that the things depending on them can be checked, and listed here so that "what does this
-      platform depend on that it does not operate" has an answer.
-    '';
-  };
-
-  config = {
-    # THE WHOLE CLUSTER-FACING RENDER, and there is nothing else: every object this platform
-    # produces that can be described as an app is described as one, in somebody else's vocabulary.
-    nixk3s.apps = lib.listToAttrs (map (x: lib.nameValuePair x.name (mkGrammarApp x)) byGrammar);
-
-    applications = lib.listToAttrs (map (x: lib.nameValuePair x.name (mkDirectApp x)) directly);
-
-    nixidy.assertions =
-      deliveryAssertions
-      ++ storageAssertions
-      ++ credentialAssertions
-      ++ serverAssertions
-      ++ runnerAssertions
-      ++ jobAssertions
-      ++ orderingAssertions
-      ++ planeAssertions
-      ++ tierAssertions;
-
-    nixidy.warnings = warnings;
-  };
+  # Preserve nixci's public resolved project default; the factory owns the option declaration.
+  config.nixci.platform.project = lib.mkOptionDefault "default";
 }

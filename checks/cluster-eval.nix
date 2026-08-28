@@ -132,6 +132,21 @@ let
 
   goodCfg = (mkEnv good).config;
 
+  # woodpecker-agent carries the same single-writer catalogue fact as the warm Crow runner, but
+  # has no state whose hostPath could accidentally force Recreate. It is therefore the focused
+  # regression for the fact the old hand-written translator dropped.
+  woodpeckerCfg = (mkEnv (lib.recursiveUpdate good {
+    nixci.runners.woodpecker = {
+      runner = "woodpecker-agent";
+      version = "0.0.0";
+      serves = "server";
+      credentials.agentSecret = {
+        secret = "example-woodpecker-agent";
+        key = "agent-secret";
+      };
+    };
+  })).config;
+
   ## ---------------------------------------------------------------------
   ## The failing direction: guards
   ## ---------------------------------------------------------------------
@@ -332,6 +347,9 @@ let
       && emptyCfg.nixci.notRendered == [ ] && emptyCfg.nixci.slots == { }
       && emptyCfg.nixci.controlSecrets == [ ] && emptyCfg.nixci.executionSecrets == [ ];
 
+    "the public platform project still resolves to the delivery default" =
+      emptyCfg.nixci.platform.project == "default";
+
     "an empty platform raises no assertion of its own -- an unused module must be silent" =
       lib.all (a: a.assertion) emptyCfg.nixidy.assertions;
 
@@ -375,7 +393,11 @@ let
       && lib.intersectLists goodCfg.nixci.controlSecrets goodCfg.nixci.executionSecrets == [ ];
 
     "no runner can appear in the slot report, because there is no slot option on that plane" =
-      goodCfg.nixci.slots == { forge = 64; server = 65; cache = 66; controller = 67; };
+      goodCfg.nixci.slots == { forge = 64; server = 65; cache = 66; controller = 67; }
+      && goodCfg.nixci.slots == goodCfg.nixci.clusterSlots;
+
+    "catalogue singleWriter reaches an otherwise stateless warm Woodpecker agent" =
+      woodpeckerCfg.nixk3s.apps.woodpecker.singleWriter;
 
     # THE ONE THING THAT CROSSES, AND IT IS DERIVED. Not a value anybody supplied: the server's own
     # name, the control plane's namespace, the cluster domain, and the port its catalogue entry says
