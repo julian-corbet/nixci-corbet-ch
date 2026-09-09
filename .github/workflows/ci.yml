@@ -1,139 +1,30 @@
-# The CI framework's own CI.
-#
-# This repository declares how code becomes an artifact for everything else, and until now nothing
-# checked it on push -- the one repository in the family whose subject is verification was the one
-# running unverified. checks/ here is built entirely around a single idea: a verifier that reports a
-# wrong answer as a checked one is worse than no verifier, because it also removes the suspicion
-# that would have caught the error. So this file is written to leave no way for a green mark to mean
-# less than it claims.
 name: ci
 
+# Manual fallback; trusted verification runs through Crow (see ci/README.md).
 on:
-  push:
-    branches: [ main ]
-  pull_request:
   workflow_dispatch:
-
-# A push to a branch that already has an open pull request fires both triggers, and the second run
-# spends its minutes re-proving exactly what the first one is proving. Grouped per ref, so a run on
-# main never cancels a run on someone else's branch.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: read
 
-# TWO INDEPENDENT JOBS, AND DELIBERATELY NO `needs:` BETWEEN THEM. `check` proves the checks pass;
-# `checks-present` proves the checks that passed are the ones this repository claims to have. The
-# second question is not downstream of the first -- a check silently disappearing is exactly the
-# case where the first job goes green with less coverage than yesterday, so making the inventory
-# wait on the run it is meant to police would defeat it. Both run on every push and each reports its
-# own verdict.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
-    name: nix flake check (every declared system)
+    name: declared checks pass
     runs-on: ubuntu-latest
-    # No run history exists for this repository yet -- this workflow is the first. Sized from the
-    # sibling that does the same work (a nixidy render through the real app grammar) and completes
-    # in about a minute on a warm cache, with a wide margin for a cold one on first run. Revisit
-    # against real durations from `gh run list` once a handful have landed; the number exists so a
-    # HUNG job fails instead of holding a runner and the concurrency slot indefinitely, not as a
-    # performance target.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v27
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-
-      # --all-systems is NOT optional here, and is the whole reason this file spells the command out
-      # rather than running a bare `nix flake check`.
-      #
-      # Without it, `nix flake check` evaluates only the checks for the RUNNER's own system and
-      # prints "omitted these incompatible systems" as a warning -- then exits 0. Every other system
-      # the flake declares goes unevaluated while CI reports green: a check that passed having
-      # tested nothing, which is the precise failure mode checks/ in this repository exists to
-      # refuse. Shipping it in this file would be self-refuting.
-      #
-      # `forAllSystems` in flake.nix is deliberately narrow so this can be strict: nixidy's
-      # `fromYAML` is import-from-derivation, so evaluating these checks for a foreign system needs
-      # a builder for that system before the check even exists, and no runner has one. Only the
-      # platform that can genuinely be evaluated is declared, and it really is evaluated.
-      #
-      # --keep-going: one failing check must not abort the checks that have not run yet. The three
-      # checks here answer three different questions -- what the catalogue resolves to, what the
-      # cluster module refuses, and what the manifests actually contain -- and a reader who is shown
-      # only the first failure cannot tell whether one thing broke or all three did. Every check
-      # reports its own verdict; the run is still red if any of them failed.
-      #
-      # --print-build-logs: cluster-render's whole output IS its log -- it asserts field by field
-      # and prints an ok/FAIL line for each. Without the build log in the run output, a red mark
-      # here names a derivation and nothing else.
-      - name: nix flake check (all systems)
-        run: nix flake check --all-systems --keep-going --print-build-logs
-
+      - run: ci/check all-systems
   checks-present:
-    name: the declared checks are still declared
+    name: declared check inventory is complete
     runs-on: ubuntu-latest
-    # Evaluation only -- no derivation is built here. Generous against a cold evaluation of nixpkgs
-    # plus the renderer on first run; see the sizing note on `check` above.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v27
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-
-      # The inventory tripwire.
-      #
-      # `nix flake check` is green when it runs zero checks. Delete checks/cluster-render.nix and
-      # its line in flake.nix and the job above goes green faster than before, with the manifests --
-      # the only place the plane boundary is asserted on the rendered BYTES rather than on the model
-      # -- no longer read by anything. Nothing in a passing run says how much it covered, so this
-      # job says it out loud: these three names, on this system, or red.
-      #
-      # It is a list to compare against, not a minimum: adding a check without adding it here fails
-      # too, which forces whoever adds one to state that it is meant to be part of the contract.
-      #
-      # The loop deliberately does NOT abort on the first missing name. Reporting "clients-eval is
-      # gone" while staying silent about cluster-render being gone as well turns one fix into three
-      # pushes. Every name is checked, every failure is printed, and the exit status at the end is
-      # what makes the run red.
-      - name: assert the check inventory
-        run: |
-          set -uo pipefail
-
-          expected="clients-eval cluster-eval cluster-render"
-
-          # --json so the comparison is on parsed values, never on the shape of human-readable
-          # output. `--apply builtins.attrNames` forces the attribute names only: the point is
-          # which checks EXIST, and the job above is what proves they pass.
-          if ! actual_json="$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames)"; then
-            echo "::error::could not evaluate checks.x86_64-linux -- the flake does not expose the checks at all"
-            exit 1
-          fi
-          actual="$(printf '%s' "$actual_json" | tr -d '[]"' | tr ',' ' ')"
-
-          echo "declared: $actual"
-          rc=0
-
-          for name in $expected; do
-            if printf ' %s ' "$actual" | grep -qF " $name "; then
-              echo "ok      $name"
-            else
-              echo "::error::check '$name' is no longer declared -- it was removed, renamed, or its import was dropped, and a green 'nix flake check' now covers less than it did"
-              rc=1
-            fi
-          done
-
-          for name in $actual; do
-            if ! printf ' %s ' "$expected" | grep -qF " $name "; then
-              echo "::error::check '$name' is declared but not listed in this workflow -- add it to 'expected' so the inventory keeps naming everything this repository claims to verify"
-              rc=1
-            fi
-          done
-
-          exit "$rc"
+      - run: ci/check list
