@@ -23,7 +23,7 @@
     # that come out -- rather than asserting that a module which merely mentions `nixk3s.apps`
     # evaluates.
     nixk3s = {
-      url = "github:julian-corbet/nixk3s-corbet-ch";
+      url = "git+https://github.com/julian-corbet/nixk3s-corbet-ch";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.nixidy.follows = "nixidy";
     };
