@@ -6,3 +6,5 @@ Additional coverage limits:
 
 - Independent exact check inventory clients-eval/cluster-eval/cluster-render must survive command extraction.
 - Remote-current native ARM matrix is additional mandatory platform coverage; an x86 Crow pass cannot replace it.
+
+Hosted Actions keeps native ARM automatic and preserves the full manual matrix; Crow runs the portable x86 checks. The independent cross-system inventory assertion remains automatic in Actions.
