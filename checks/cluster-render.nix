@@ -62,6 +62,7 @@ pkgs.runCommand "nixci-cluster-render"
   CACHE_S=$manifests/example-cache/Service-example-cache.yaml
   BLD_D=$manifests/example-builder/Deployment-example-builder.yaml
   BLD_NS=$manifests/example-builder/Namespace-example-ci-runners.yaml
+  WOOD_D=$manifests/example-woodpecker/Deployment-example-woodpecker.yaml
   CTL_SA=$manifests/example-controller/ServiceAccount-example-controller-gha-rs-controller.yaml
   CTL_D=$manifests/example-controller/Deployment-example-controller.yaml
   POOL_SA=$manifests/example-pool/ServiceAccount-example-pool.yaml
@@ -73,12 +74,13 @@ pkgs.runCommand "nixci-cluster-render"
   echo
   echo "== THE EXECUTION PLANE RENDERS NO SERVICE. Not one, anywhere, for any workload. =="
   absent "a Service for the warm builder" "$manifests/example-builder/Service-example-builder.yaml"
+  absent "a Service for the Woodpecker agent" "$manifests/example-woodpecker/Service-example-woodpecker.yaml"
   absent "a Service for the runner pool"  "$manifests/example-pool/Service-example-pool.yaml"
   for svc in $(find -L $manifests -type f -name 'Service-*.yaml' | sort); do
     check "$(basename $svc): lands in the control namespace" "$CONTROL_NS" "$(y '.metadata.namespace' $svc)"
   done
   # And the same claim from the other side: nothing at all is rendered into the execution namespace
-  # except the two workloads that belong there.
+  # except the workloads that belong there.
   for f in $(find -L $manifests -type f -name '*.yaml' | sort); do
     ns=$(y '.metadata.namespace // ""' $f)
     kind=$(y '.kind' $f)
@@ -92,7 +94,7 @@ pkgs.runCommand "nixci-cluster-render"
   echo "== NO CONTROL-PLANE SECRET NAME APPEARS IN AN EXECUTION-PLANE MANIFEST =="
   # The forge's OAuth client secret and the server's admin token live in this object. A build script
   # runs in the execution plane; this is the grep that says it cannot reach them.
-  for f in $(find -L $manifests/example-builder $manifests/example-pool -type f | sort); do
+  for f in $(find -L $manifests/example-builder $manifests/example-woodpecker $manifests/example-pool -type f | sort); do
     if grep -q 'example-ci-secrets' "$f"; then
       echo "  FAIL control-plane Secret named in an execution-plane manifest: $f"; fail=1
     fi
@@ -103,7 +105,8 @@ pkgs.runCommand "nixci-cluster-render"
   check "and it arrives as a reference, never as a value" "null" \
     "$(y '.spec.template.spec.containers[0].env[] | select(.name == "CROW_AGENT_SECRET") | .value' $BLD_D)"
   check "the two planes' Secret sets are disjoint (control)"   "example-ci-secrets" "$controlSecrets"
-  check "the two planes' Secret sets are disjoint (execution)" "example-pool-token example-runner-secrets" "$executionSecrets"
+  check "the two planes' Secret sets are disjoint (execution)" \
+    "example-pool-token example-runner-secrets example-woodpecker-agent" "$executionSecrets"
 
   echo
   echo "== THE ONE THING THAT CROSSES THE PLANES, AND IT IS DERIVED RATHER THAN CONFIGURED =="
@@ -117,6 +120,7 @@ pkgs.runCommand "nixci-cluster-render"
   check "server namespace"  "$CONTROL_NS" "$(y '.metadata.namespace' $SRV_D)"
   check "cache namespace"   "$CONTROL_NS" "$(y '.metadata.namespace' $CACHE_D)"
   check "builder namespace" "$EXEC_NS"    "$(y '.metadata.namespace' $BLD_D)"
+  check "Woodpecker namespace" "$EXEC_NS" "$(y '.metadata.namespace' $WOOD_D)"
   check "pool namespace"    "$EXEC_NS"    "$(y '.metadata.namespace' $POOL_SA)"
 
   echo
@@ -201,6 +205,11 @@ pkgs.runCommand "nixci-cluster-render"
   check "no resource sizing was invented for it" "null" "$(y '.spec.template.spec.containers[0].resources' $BLD_D)"
 
   echo
+  echo "== catalogue singleWriter reaches a stateless warm agent =="
+  check "Woodpecker rolls by replacement even with no state volume to force it" \
+    "Recreate" "$(y '.spec.strategy.type' $WOOD_D)"
+
+  echo
   echo "== what the grammar cannot express passes through verbatim =="
   present "the controller's chart output" "$CTL_SA"
   present "the controller's Deployment"   "$CTL_D"
@@ -241,7 +250,7 @@ pkgs.runCommand "nixci-cluster-render"
 
   echo
   echo "== every Application lands in the platform's project, at its own plane's destination =="
-  for app in example-forge example-server example-cache example-controller example-nightly example-builder example-pool; do
+  for app in example-forge example-server example-cache example-controller example-nightly example-builder example-woodpecker example-pool; do
     check "$app project" "example-ci" "$(y '.spec.project' $manifests/apps/Application-$app.yaml)"
   done
   check "a control-plane destination"   "$CONTROL_NS" "$(y '.spec.destination.namespace' $manifests/apps/Application-example-server.yaml)"
@@ -250,8 +259,8 @@ pkgs.runCommand "nixci-cluster-render"
   echo
   echo "== the planes and the render split are countable =="
   check "control plane"        "example-cache example-controller example-forge example-nightly example-remote-forge example-server" "$controlPlane"
-  check "execution plane"      "example-builder example-pool" "$executionPlane"
-  check "rendered by the grammar" "example-builder example-cache example-forge example-server" "$byGrammar"
+  check "execution plane"      "example-builder example-pool example-woodpecker" "$executionPlane"
+  check "rendered by the grammar" "example-builder example-cache example-forge example-server example-woodpecker" "$byGrammar"
   check "rendered below it"       "example-controller example-nightly example-pool" "$directly"
 
   if [ "$fail" -ne 0 ]; then

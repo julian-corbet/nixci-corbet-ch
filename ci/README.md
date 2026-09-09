@@ -18,12 +18,18 @@ that published revision with `SOURCE_ARCHIVE` set to its worker-visible path and
 embedded Git commit before extracting it. Only trusted reviewed source belongs
 on a worker that shares the build environment.
 
-Automatic push validation is not configured during this manual outage mode.
-Record the Crow run and exact source commit when reviewing a change. Reuse
-results for unchanged source, dependencies, toolchain and environment; inspect
-an existing run before submitting another one. GitHub remains an explicit manual
-fallback where a workflow exists. Do not count an unrun platform, package,
-hardware test, or publication gate as passed.
+The existing GitHub native x86 and ARM matrix and lazy cross-system inventory
+remain configured. Crow's native Linux result does not replace ARM execution.
+The hosted outage leaves that ARM coverage unavailable until its native runner
+can run. Record each run and exact source commit when reviewing a change.
+Reuse results for unchanged source, dependencies, toolchain and environment;
+inspect an existing run before submitting another one.
+
+This repository uses import-from-derivation for the renderer. `ci/check eval`
+can therefore fail when a foreign evaluation dependency cannot be built. The
+existing GitHub workflow's lazy per-system inventory avoids pretending that
+all-system evaluation can replace either native architecture check. The exact
+three-check native inventory is also enforced by `ci/check`.
 
 The source archive avoids a GitHub checkout. Locked flake inputs still need their
 source in the Nix store/cache or an accessible authenticated source mirror.

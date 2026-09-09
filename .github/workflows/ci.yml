@@ -1,30 +1,159 @@
+# The CI framework's own CI.
+#
+# This repository declares how code becomes an artifact for everything else, and until now nothing
+# checked it on push -- the one repository in the family whose subject is verification was the one
+# running unverified. checks/ here is built entirely around a single idea: a verifier that reports a
+# wrong answer as a checked one is worse than no verifier, because it also removes the suspicion
+# that would have caught the error. So this file is written to leave no way for a green mark to mean
+# less than it claims.
 name: ci
 
-# Manual fallback; trusted verification runs through Crow (see ci/README.md).
 on:
+  push:
+    branches: [ main ]
+  pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
+# A push to a branch that already has an open pull request fires both triggers, and the second run
+# spends its minutes re-proving exactly what the first one is proving. Grouped per ref, so a run on
+# main never cancels a run on someone else's branch.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+# The native checks, the all-system evaluation and the inventory are independent verdicts. The
+# matrix builds every check on hardware of its declared architecture; the lazy cross-system pass
+# proves no declared system is hidden; the inventory proves a check did not disappear while both
+# stayed green.
 jobs:
   check:
-    name: declared checks pass
+    name: nix flake check (${{ matrix.system }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: nix flake check (${{ matrix.system }})
+        run: |
+          set -euo pipefail
+          actual=$(nix eval --impure --raw --expr builtins.currentSystem)
+          if [ "$actual" != "${{ matrix.system }}" ]; then
+            echo "runner is '$actual', expected '${{ matrix.system }}'" >&2
+            exit 1
+          fi
+          nix flake check --keep-going --print-build-logs
+
+  eval-all-systems:
+    name: every declared system and check is covered
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v27
-      - run: ci/check all-systems
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      # nixidy parses rendered YAML through an intentional import-from-derivation. A cross-system
+      # `nix flake check --all-systems --no-build` therefore cannot evaluate these checks: no-build
+      # forbids the fromYAML derivation evaluation needs, while building the ARM derivation on this
+      # x86 runner would be equally false coverage. The two native matrix jobs above perform the
+      # complete evaluation and build. This independent lazy pass proves that their matrix still
+      # names every system and every check the flake declares.
+      - name: assert every system and check is covered
+        run: |
+          set -euo pipefail
+
+          expected_systems='["aarch64-linux","x86_64-linux"]'
+          actual_systems=$(nix eval --json .#checks --apply builtins.attrNames)
+          if [ "$actual_systems" != "$expected_systems" ]; then
+            echo "::error::declared systems changed: expected $expected_systems, got $actual_systems"
+            exit 1
+          fi
+
+          expected_checks='["clients-eval","cluster-eval","cluster-render"]'
+          for system in aarch64-linux x86_64-linux; do
+            actual_checks=$(nix eval --json ".#checks.$system" --apply builtins.attrNames)
+            if [ "$actual_checks" != "$expected_checks" ]; then
+              echo "::error::$system checks changed: expected $expected_checks, got $actual_checks"
+              exit 1
+            fi
+            echo "$system: $actual_checks"
+          done
+
   checks-present:
-    name: declared check inventory is complete
+    name: the declared checks are still declared
     runs-on: ubuntu-latest
+    # Evaluation only -- no derivation is built here. Generous against a cold evaluation of nixpkgs
+    # plus the renderer on first run; see the sizing note on `check` above.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v27
-      - run: ci/check list
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # The inventory tripwire.
+      #
+      # `nix flake check` is green when it runs zero checks. Delete checks/cluster-render.nix and
+      # its line in flake.nix and the job above goes green faster than before, with the manifests --
+      # the only place the plane boundary is asserted on the rendered BYTES rather than on the model
+      # -- no longer read by anything. Nothing in a passing run says how much it covered, so this
+      # job says it out loud: these three names, on this system, or red.
+      #
+      # It is a list to compare against, not a minimum: adding a check without adding it here fails
+      # too, which forces whoever adds one to state that it is meant to be part of the contract.
+      #
+      # The loop deliberately does NOT abort on the first missing name. Reporting "clients-eval is
+      # gone" while staying silent about cluster-render being gone as well turns one fix into three
+      # pushes. Every name is checked, every failure is printed, and the exit status at the end is
+      # what makes the run red.
+      - name: assert the check inventory
+        run: |
+          set -uo pipefail
+
+          expected="clients-eval cluster-eval cluster-render"
+
+          # --json so the comparison is on parsed values, never on the shape of human-readable
+          # output. `--apply builtins.attrNames` forces the attribute names only: the point is
+          # which checks EXIST, and the job above is what proves they pass.
+          if ! actual_json="$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames)"; then
+            echo "::error::could not evaluate checks.x86_64-linux -- the flake does not expose the checks at all"
+            exit 1
+          fi
+          actual="$(printf '%s' "$actual_json" | tr -d '[]"' | tr ',' ' ')"
+
+          echo "declared: $actual"
+          rc=0
+
+          for name in $expected; do
+            if printf ' %s ' "$actual" | grep -qF " $name "; then
+              echo "ok      $name"
+            else
+              echo "::error::check '$name' is no longer declared -- it was removed, renamed, or its import was dropped, and a green 'nix flake check' now covers less than it did"
+              rc=1
+            fi
+          done
+
+          for name in $actual; do
+            if ! printf ' %s ' "$expected" | grep -qF " $name "; then
+              echo "::error::check '$name' is declared but not listed in this workflow -- add it to 'expected' so the inventory keeps naming everything this repository claims to verify"
+              rc=1
+            fi
+          done
+
+          exit "$rc"

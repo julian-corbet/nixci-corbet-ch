@@ -28,7 +28,7 @@ printf 'Worker: %s\nDeclared native checks:\n%s\n' "$ci_system" "$ci_inventory"
 
 # This framework must never report success after silently losing a check.
 ci_expected=$(printf '%s\n' clients-eval cluster-eval cluster-render)
-if [[ "$ci_system" != x86_64-linux || "$ci_inventory" != "$ci_expected" ]]; then
+if [[ "$ci_inventory" != "$ci_expected" ]]; then
   printf '%s\n' 'Check inventory differs from clients-eval, cluster-eval, cluster-render.' >&2
   exit 1
 fi

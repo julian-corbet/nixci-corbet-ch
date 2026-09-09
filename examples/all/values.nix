@@ -16,6 +16,7 @@
 #   - a runner controller, delivered as whole objects, in the CONTROL plane;
 #   - a warm builder, anchoring the EXECUTION namespace, on its own Secret, with warm caches and a
 #     server address nobody wrote down;
+#   - a stateless Woodpecker warm agent, proving catalogue singleWriter alone forces Recreate;
 #   - an ephemeral runner pool for the remote forge, bound back to the controller across the planes;
 #   - a schedule, which is not a running process and so is delivered as an object.
 {
@@ -167,6 +168,18 @@
       # A DIFFERENT SECRET FROM THE SERVER'S, carrying the same shared value and nothing else. Name
       # the server's here instead and evaluation fails.
       credentials.agentSecret = { secret = "example-runner-secrets"; key = "agent-secret"; };
+    };
+
+    # No state or cache happens to force its rollout strategy. Recreate therefore proves that the
+    # factory projected the catalogue's singleWriter fact, which the old translator dropped.
+    example-woodpecker = {
+      runner = "woodpecker-agent";
+      version = "0.0.0";
+      serves = "example-server";
+      credentials.agentSecret = {
+        secret = "example-woodpecker-agent";
+        key = "agent-secret";
+      };
     };
 
     # An ephemeral pool for the remote forge, reconciled by the controller in the OTHER plane.
