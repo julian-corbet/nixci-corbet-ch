@@ -10,6 +10,13 @@ variables:
     default: ''
   CHECK_TARGET:
     default: native
+  # Temporary baseline for capacity comparisons; choose each run's measured budget.
+  NIX_BUILD_JOBS:
+    default: '1'
+  NIX_BUILD_CORES:
+    default: '1'
+  NIX_EVAL_CORES:
+    default: '1'
 steps:
   - name: verified-source
     image: bash
@@ -26,8 +33,5 @@ steps:
   - name: native-checks
     image: bash
     depends_on: [verified-source]
-    environment:
-      NIX_BUILD_JOBS: '1'
-      NIX_BUILD_CORES: '1'
     commands:
       - timeout --signal=TERM --kill-after=30s 30m bash ci/check "${CHECK_TARGET:-native}"

@@ -16,10 +16,12 @@ esac
 
 ci_jobs=${NIX_BUILD_JOBS:-1}
 ci_cores=${NIX_BUILD_CORES:-1}
-for ci_limit in "$ci_jobs" "$ci_cores"; do
+ci_eval_cores=${NIX_EVAL_CORES:-1}
+for ci_limit in "$ci_jobs" "$ci_cores" "$ci_eval_cores"; do
   [[ "$ci_limit" =~ ^[1-9][0-9]*$ ]] || { echo 'Nix build limits must be positive integers.' >&2; exit 2; }
 done
-nix_ci=(nix --option max-jobs "$ci_jobs" --option cores "$ci_cores" --option eval-cores 1)
+nix_ci=(nix --option max-jobs "$ci_jobs" --option cores "$ci_cores" --option eval-cores "$ci_eval_cores")
+printf 'Nix budget: jobs=%s build-cores=%s eval-cores=%s\n' "$ci_jobs" "$ci_cores" "$ci_eval_cores"
 ci_system=$("${nix_ci[@]}" eval --impure --raw --expr builtins.currentSystem)
 ci_inventory=$("${nix_ci[@]}" eval --no-update-lock-file --raw \
   ".#checks.${ci_system}" --apply 'checks: builtins.concatStringsSep "\n" (builtins.attrNames checks)')

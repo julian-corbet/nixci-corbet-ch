@@ -1,8 +1,11 @@
 # Running checks
 
 Run `ci/check` on a trusted build worker. The default runs the existing checks for
-that worker's architecture with one build job, one build core and one evaluation
-core. `ci/check list` lists the actual check inventory and refuses empty coverage.
+that worker's architecture. `NIX_BUILD_JOBS`, `NIX_BUILD_CORES` and
+`NIX_EVAL_CORES` are configurable per dispatch and are printed in the run log.
+Their current defaults of one are a temporary measurement baseline, not a
+throughput target. Choose a budget for the available worker capacity; account
+for simultaneous workflows and host-daemon builds. `ci/check list` lists the actual check inventory and refuses empty coverage.
 Use `ci/check CHECK` to rerun an affected check after diagnosing a failure.
 
 `ci/check eval` evaluates every declared system without building check outputs.
